@@ -1,0 +1,335 @@
+---
+title: "VAR_External_Instrument_ECB"
+author: "MandarPriya_Phatak"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '2'
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+    toc: yes
+    toc_depth: '2'
+---
+
+```{r setup}
+knitr::opts_chunk$set(cache = TRUE, cache.lazy = FALSE, warning = FALSE,
+                      message = FALSE,echo = TRUE, dpi = 360, warning = FALSE,
+                      fig.width = 10, fig.height = 9)
+
+```
+
+# prequisite libraries
+
+```{r}
+library(tidyquant)
+library(tidyverse)
+library(Matrix)
+library(readxl)
+library(dplyr)
+library(broom)
+library(modeltime)
+library(readr)
+library(vars)
+library(svars)
+```
+
+# reading the data
+
+```{r}
+data <- read_csv("data_final.csv")
+data |> head()
+
+```
+## Data exploration using skimr
+```{r}
+
+library(skimr)
+
+data_var <- data |> 
+  dplyr::select(-date,-ois_1y)
+
+skim(data = data_var)
+
+```
+```{r}
+library(DataExplorer)
+DataExplorer::create_report(data = data_var)
+```
+```{r}
+## Selecting the number of lags, and no intercept
+VARselect(data_var, lag.max = 12,type = "none")
+```
+## We can see that number of lags based on bic is 2
+```{r}
+# VAR model without constant
+var <- vars::VAR(data_var,lag.max = 12,ic = "SC",type = "none")
+
+
+
+## Residual 
+
+res = data.frame(residuals(var))
+
+
+## Instrument 
+
+instrument <-(data[,"ois_1y"])
+
+
+instrument <- instrument[3:nrow(instrument), , drop = FALSE]
+
+## Aligining the dependent based on ordering
+
+
+# Extract column names from the residuals dataframe
+seriesnames <- colnames(res)
+origorder <- seriesnames
+
+# Check if the dependent variable (assuming "ffr") is in the residuals
+dependent <- "de1y"
+if (dependent %in% seriesnames) {
+  # Reorder columns to put dependent first
+  seriesnames <- seriesnames[seriesnames != dependent]
+  seriesnames <- c(dependent, seriesnames)
+  
+  # Reorder the columns in res
+  res <- res[, seriesnames]
+} else {
+  stop(paste("The series you are trying to instrument (", dependent, ") is not a series in the residual dataframe.", sep =""))
+}
+
+## combining the instrument with the residual
+
+
+res[,"instrument"] <- instrument
+
+# Create matrix u from the reordered residuals
+u <- as.matrix(res[, seriesnames])
+
+# Remove rows with NA values in the instrument column
+u <- u[!is.na(res$instrument), ]
+
+print("Step 2 completed: Residual matrix created.")
+print(dim(u))
+
+## Intermediate steps 
+
+# Useful constants
+  T <- nrow(u)
+  k <- ncol(u)
+  p <- 2
+
+ # Some necessary parts of the covariance matrix
+  gamma <- (1 / (T - k*p - 1)) * t(u) %*% u
+  gamma_11 <- gamma[1,1]
+  gamma_21 <- matrix(gamma[2:nrow(gamma), 1], c(k-1,1))
+  gamma_22 <- matrix(gamma[2:nrow(gamma), 2:nrow(gamma)], c(k-1,k-1))
+
+
+## First and Second stage regression 
+
+# First stage regression
+firststage <- lm(de1y ~ instrument, data = res)
+res[names(predict(firststage)), "fs"] <- predict(firststage)
+
+print("Step 4 completed: First stage regression performed.")
+print(summary(firststage))
+
+
+
+
+# Now get the second-stage coefficients
+coefs <- rep(0, k)
+names(coefs) <- seriesnames
+for (i in 1:k) {
+  s <- seriesnames[i]
+  if (s != "de1y") {  # Using "d" as the instrumented variable
+    secondstage <- lm(as.formula(paste(s, " ~ fs")), res)
+    coefs[i] <- secondstage$coefficients["fs"]
+  } else {
+    coefs[i] <- 1
+  }
+}
+
+print("Step 5 completed: Second stage regression performed.")
+print(coefs)
+
+
+## Identitfying the factor 
+
+s21_on_s11 <- matrix(coefs[2:k], c(k-1,1))
+
+Q <- (s21_on_s11 * gamma_11) %*% t(s21_on_s11) - (gamma_21 %*% t(s21_on_s11) + s21_on_s11 %*% t(gamma_21)) + gamma_22
+
+s12s12 <- t(gamma_21 - s21_on_s11 * gamma_11) %*% solve(Q) %*% (gamma_21 - s21_on_s11 * gamma_11)
+
+s11_squared <- gamma_11 - s12s12
+
+sp <- as.numeric(sqrt(s11_squared))
+
+print("Step 6 completed: Intermediate matrices calculated.")
+print("sp value:")
+print(sp)
+
+result <- sp * coefs[origorder]
+print("Step 7 completed: Final result calculated.")
+print("Final result:")
+print(result)
+
+
+## IRFs plot
+
+ma_representation <- Phi(var, 50)
+irfs <- apply(ma_representation, 3, function(x) x %*% result)
+irfs <- as.data.frame(t(irfs))
+colnames(irfs) <- names(result)
+irfs <- mutate(irfs, horizon = 0:50)
+irfs <- gather(irfs, key = variable, value = response, -horizon)
+ggplot(irfs, aes(x = horizon, y = response, group = variable, color = variable)) + geom_line()
+```
+### Checking with Robust Errors:- using vcovHAC, waldtest
+
+
+```{r}
+library(sandwich)
+library(lmtest)
+
+var <- vars::VAR(data_var, lag.max = 12, ic = "SC", type = "none")
+
+res = data.frame(residuals(var))
+```
+
+
+```{r}
+instrument <- (data[,"ois_1y"])
+instrument <- instrument[3:nrow(instrument), , drop = FALSE]
+```
+
+
+```{r}
+# Extract column names from the residuals dataframe
+seriesnames <- colnames(res)
+origorder <- seriesnames
+
+# Check if the dependent variable (assuming "ffr") is in the residuals
+dependent <- "de1y"
+if (dependent %in% seriesnames) {
+  # Reorder columns to put dependent first
+  seriesnames <- seriesnames[seriesnames != dependent]
+  seriesnames <- c(dependent, seriesnames)
+  
+  # Reorder the columns in res
+  res <- res[, seriesnames]
+} else {
+  stop(paste("The series you are trying to instrument (", dependent, ") is not a series in the residual dataframe.", sep =""))
+}
+
+res[,"instrument"] <- instrument
+
+# Create matrix u from the reordered residuals
+u <- as.matrix(res[, seriesnames])
+
+# Remove rows with NA values in the instrument column
+u <- u[!is.na(res$instrument), ]
+
+print("Step 2 completed: Residual matrix created.")
+print(dim(u))
+```
+
+
+```{r}
+# Useful constants
+T <- nrow(u)
+k <- ncol(u)
+p <- 2
+
+# Some necessary parts of the covariance matrix
+gamma <- (1 / (T - k*p - 1)) * t(u) %*% u
+gamma_11 <- gamma[1,1]
+gamma_21 <- matrix(gamma[2:nrow(gamma), 1], c(k-1,1))
+gamma_22 <- matrix(gamma[2:nrow(gamma), 2:nrow(gamma)], c(k-1,k-1))
+
+# First stage regression
+firststage <- lm(de1y ~ instrument, data = res)
+res[names(predict(firststage)), "fs"] <- predict(firststage)
+
+print("Step 4 completed: First stage regression performed.")
+print(summary(firststage))
+
+# Calculate robust standard errors for first stage
+robust_se_first <- sqrt(diag(vcovHAC(firststage)))
+print("Robust standard errors for first stage:")
+print(robust_se_first)
+
+# Calculate robust F-statistic
+robust_f <- waldtest(firststage, vcov = vcovHAC(firststage))
+print("Robust F-statistic:")
+print(robust_f)
+```
+
+
+```{r}
+# Now get the second-stage coefficients
+coefs <- rep(0, k)
+names(coefs) <- seriesnames
+robust_se_second <- list()
+for (i in 1:k) {
+  s <- seriesnames[i]
+  if (s != "de1y") {  # Using "d" as the instrumented variable
+    secondstage <- lm(as.formula(paste(s, " ~ fs")), res)
+    coefs[i] <- secondstage$coefficients["fs"]
+    
+    # Calculate robust standard errors for second stage
+    robust_se_second[[s]] <- sqrt(diag(vcovHC(secondstage, type = "HC1")))
+    print(paste("Robust standard errors for", s, "in second stage:"))
+    print(robust_se_second[[s]])
+  } else {
+    coefs[i] <- 1
+  }
+}
+
+print("Step 5 completed: Second stage regression performed.")
+print(coefs)
+```
+
+
+```{r}
+s21_on_s11 <- matrix(coefs[2:k], c(k-1,1))
+
+Q <- (s21_on_s11 * gamma_11) %*% t(s21_on_s11) - (gamma_21 %*% t(s21_on_s11) + s21_on_s11 %*% t(gamma_21)) + gamma_22
+
+s12s12 <- t(gamma_21 - s21_on_s11 * gamma_11) %*% solve(Q) %*% (gamma_21 - s21_on_s11 * gamma_11)
+
+s11_squared <- gamma_11 - s12s12
+
+sp <- as.numeric(sqrt(s11_squared))
+
+print("Step 6 completed: Intermediate matrices calculated.")
+print("sp value:")
+print(sp)
+
+result <- sp * coefs[origorder]
+print("Step 7 completed: Final result calculated.")
+print("Final result:")
+print(result)
+```
+
+
+```{r}
+ma_representation <- Phi(var, 50)
+irfs <- apply(ma_representation, 3, function(x) x %*% result)
+irfs <- as.data.frame(t(irfs))
+colnames(irfs) <- names(result)
+irfs <- mutate(irfs, horizon = 0:50)
+irfs <- gather(irfs, key = variable, value = response, -horizon)
+ggplot(irfs, aes(x = horizon, y = response, group = variable, color = variable)) + geom_line()
+```
+
+
+
+
