@@ -285,7 +285,7 @@ for (i in 1:k) {
     coefs[i] <- secondstage$coefficients["fs"]
     
     # Calculate robust standard errors for second stage
-    robust_se_second[[s]] <- sqrt(diag(vcovHC(secondstage, type = "HC1")))
+    robust_se_second[[s]] <- sqrt(diag(vcovHAC(secondstage)))
     print(paste("Robust standard errors for", s, "in second stage:"))
     print(robust_se_second[[s]])
   } else {
